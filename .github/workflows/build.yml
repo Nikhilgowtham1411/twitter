@@ -1,0 +1,50 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build release APK
+        run: |
+          chmod +x gradlew
+          set -o pipefail
+          ./gradlew assembleRelease --no-daemon --stacktrace 2>&1 | tee build.log
+
+      - name: Surface build errors as an annotation
+        if: failure()
+        run: |
+          msg=$(grep -E "^e: |error:|What went wrong|Execution failed|Could not|Unresolved|FAILED" -A2 build.log | head -40 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+          echo "::error title=Gradle build errors::${msg}"
+
+      - name: Rename APK
+        run: cp app/build/outputs/apk/release/app-release.apk XSaver.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: XSaver-apk
+          path: XSaver.apk
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: X Saver 1.0.${{ github.run_number }}
+          files: XSaver.apk
+          make_latest: true
