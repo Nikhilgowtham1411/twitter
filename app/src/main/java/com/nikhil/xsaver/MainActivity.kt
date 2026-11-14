@@ -24,6 +24,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        DownloadStore.init(this)
         enableEdgeToEdge(
             statusBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT),
             navigationBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT),
@@ -53,7 +54,7 @@ class MainActivity : ComponentActivity() {
         handleShare(intent)
     }
 
-    /** X app -> Share -> X Saver: the shared text carries the post link. */
+    /** X app -> Share -> "X Saver": the shared text carries the post link. */
     private fun handleShare(intent: Intent?) {
         if (intent == null || intent.action != Intent.ACTION_SEND) return
         val text = intent.getStringExtra(Intent.EXTRA_TEXT) ?: return
@@ -62,31 +63,15 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun download(tweet: Tweet, index: Int, variant: Variant) {
-        val media = tweet.media[index]
-        DownloadService.enqueue(this, variant.url, fileName(tweet, index, variant.url, media.kind), media.kind)
-        Toast.makeText(this, "Download started. Progress is in your notifications.", Toast.LENGTH_SHORT).show()
+        DownloadService.enqueueDownloads(this, tweet, listOf(index to variant))
+        vm.markAdded(listOf(index))
+        Toast.makeText(this, "Added to downloads", Toast.LENGTH_SHORT).show()
     }
 
     private fun downloadAll(tweet: Tweet) {
-        tweet.media.forEachIndexed { index, media ->
-            val best = media.variants.first()
-            DownloadService.enqueue(this, best.url, fileName(tweet, index, best.url, media.kind), media.kind)
-        }
-        Toast.makeText(this, "Downloading ${tweet.media.size} files", Toast.LENGTH_SHORT).show()
-    }
-
-    private fun fileName(tweet: Tweet, index: Int, url: String, kind: MediaKind): String {
-        val handle = tweet.authorHandle.ifEmpty { "x" }
-        val ext = if (kind == MediaKind.PHOTO) photoExtension(url) else "mp4"
-        return "${handle}_${tweet.id}_${index + 1}.$ext"
-    }
-
-    private fun photoExtension(url: String): String {
-        val path = url.substringBefore('?').lowercase()
-        return when {
-            path.endsWith(".png") -> "png"
-            path.endsWith(".webp") -> "webp"
-            else -> "jpg"
-        }
+        val picks = tweet.media.mapIndexed { index, media -> index to media.variants.first() }
+        DownloadService.enqueueDownloads(this, tweet, picks)
+        vm.markAdded(picks.map { it.first })
+        Toast.makeText(this, "Added ${picks.size} files to downloads", Toast.LENGTH_SHORT).show()
     }
 }

@@ -1,3 +1,4 @@
 <resources>
     <string name="app_name">X Saver</string>
+    <string name="quick_save_label">X Saver · Quick save</string>
 </resources>

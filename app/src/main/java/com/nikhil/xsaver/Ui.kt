@@ -1,5 +1,9 @@
 package com.nikhil.xsaver
 
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -15,6 +19,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -25,13 +30,16 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
@@ -42,6 +50,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -71,8 +80,10 @@ fun XSaverApp(
     onDownload: (Tweet, Int, Variant) -> Unit,
     onDownloadAll: (Tweet) -> Unit,
 ) {
+    val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
     val focus = LocalFocusManager.current
+    val history by DownloadStore.items.collectAsState()
 
     MaterialTheme(colorScheme = XColors) {
         Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
@@ -107,6 +118,7 @@ fun XSaverApp(
                     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         OutlinedButton(
                             onClick = {
+                                // Replaces whatever link was there before.
                                 val pasted = clipboard.getText()?.text
                                 if (!pasted.isNullOrBlank()) {
                                     vm.input = pasted
@@ -123,12 +135,18 @@ fun XSaverApp(
                             },
                             modifier = Modifier.weight(1f),
                         ) { Text("Get media") }
+                        if (vm.input.isNotEmpty() || vm.state !is UiState.Idle) {
+                            TextButton(onClick = { vm.reset() }) { Text("Clear") }
+                        }
                     }
                 }
 
                 when (val s = vm.state) {
                     is UiState.Idle -> item {
-                        Note("Share a post from X to this app, or paste its link above.")
+                        Note(
+                            "Tip: in X tap Share and pick \"X Saver · Quick save\" to download " +
+                                "without opening this app. Pick \"X Saver\" to choose the video quality first."
+                        )
                     }
 
                     is UiState.Loading -> item {
@@ -153,8 +171,40 @@ fun XSaverApp(
                             }
                         }
                         itemsIndexed(s.tweet.media) { index, media ->
-                            MediaCard(index, media) { variant -> onDownload(s.tweet, index, variant) }
+                            MediaCard(index, media, added = index in vm.added) { variant ->
+                                onDownload(s.tweet, index, variant)
+                            }
                         }
+                    }
+                }
+
+                if (history.isNotEmpty()) {
+                    item {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(top = 10.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                "Downloads",
+                                style = MaterialTheme.typography.titleLarge,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onBackground,
+                            )
+                            if (history.any { !it.isActive }) {
+                                TextButton(onClick = { DownloadStore.clearFinished() }) { Text("Clear finished") }
+                            }
+                        }
+                    }
+                    items(history, key = { it.id }) { item ->
+                        HistoryRow(
+                            item = item,
+                            onOpen = { openFile(context, item) },
+                            onCancel = { DownloadStore.requestCancel(item.id) },
+                            onRetry = { DownloadService.retry(context, item) },
+                        )
                     }
                 }
             }
@@ -209,7 +259,7 @@ private fun AuthorBlock(tweet: Tweet) {
 }
 
 @Composable
-private fun MediaCard(index: Int, media: MediaItem, onDownload: (Variant) -> Unit) {
+private fun MediaCard(index: Int, media: MediaItem, added: Boolean, onDownload: (Variant) -> Unit) {
     var selected by remember(media) { mutableIntStateOf(0) }
     val label = when (media.kind) {
         MediaKind.VIDEO -> "Video"
@@ -258,8 +308,97 @@ private fun MediaCard(index: Int, media: MediaItem, onDownload: (Variant) -> Uni
                         }
                     }
                 }
-                Button(onClick = { onDownload(media.variants[selected]) }) { Text("Download") }
+                Button(onClick = { onDownload(media.variants[selected]) }) {
+                    Text(if (added) "Added ✓" else "Download")
+                }
             }
         }
+    }
+}
+
+@Composable
+private fun HistoryRow(
+    item: HistoryItem,
+    onOpen: () -> Unit,
+    onCancel: () -> Unit,
+    onRetry: () -> Unit,
+) {
+    val failed = item.status == Status.FAILED
+    Card(
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+    ) {
+        Row(
+            modifier = Modifier.padding(10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            AsyncImage(
+                model = item.thumb,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier
+                    .size(56.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(MaterialTheme.colorScheme.surface),
+            )
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Text(
+                    item.title,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                Text(
+                    statusText(item),
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (item.status == Status.DOWNLOADING && item.progress > 0) {
+                    LinearProgressIndicator(
+                        progress = item.progress / 100f,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                } else if (item.status == Status.DOWNLOADING || item.status == Status.FETCHING) {
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                }
+            }
+            when {
+                item.status == Status.DONE -> TextButton(onClick = onOpen) { Text("Open") }
+                item.isActive -> TextButton(onClick = onCancel) { Text("Cancel") }
+                item.url != null -> TextButton(onClick = onRetry) { Text("Retry") }
+            }
+        }
+    }
+}
+
+private fun statusText(item: HistoryItem): String = when (item.status) {
+    Status.FETCHING -> "Looking up the post…"
+    Status.QUEUED -> "Waiting in queue"
+    Status.DOWNLOADING ->
+        if (item.progress > 0) "${item.progress}% · ${formatSize(item.bytes)}" else "Starting… ${formatSize(item.bytes)}"
+    Status.DONE -> {
+        val folder = if (item.kind == MediaKind.PHOTO) "Pictures/XSaver" else "Movies/XSaver"
+        "Saved · $folder"
+    }
+    Status.FAILED -> "Failed: ${item.error ?: "unknown error"}"
+    Status.CANCELLED -> "Cancelled"
+}
+
+private fun openFile(context: Context, item: HistoryItem) {
+    val uri = item.uri?.let { Uri.parse(it) } ?: return
+    val intent = Intent(Intent.ACTION_VIEW)
+        .setDataAndType(uri, item.mime ?: "*/*")
+        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    try {
+        context.startActivity(intent)
+    } catch (e: Exception) {
+        Toast.makeText(context, "Couldn't open it. The file may have been moved or deleted.", Toast.LENGTH_SHORT).show()
     }
 }

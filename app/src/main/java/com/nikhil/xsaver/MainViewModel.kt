@@ -24,16 +24,36 @@ class MainViewModel : ViewModel() {
     var state by mutableStateOf<UiState>(UiState.Idle)
         private set
 
+    /** Indexes of media in the current post that were already sent to the download queue. */
+    var added by mutableStateOf(setOf<Int>())
+        private set
+
     private var job: Job? = null
 
     fun fetch() {
         val text = input.trim()
         if (text.isEmpty()) return
         job?.cancel()
+        added = emptySet()
         state = UiState.Loading
         job = viewModelScope.launch {
             state = withContext(Dispatchers.IO) { load(text) }
         }
+    }
+
+    /** Clears the link and result so the next link can be pasted straight away. */
+    fun reset() {
+        job?.cancel()
+        input = ""
+        added = emptySet()
+        state = UiState.Idle
+    }
+
+    /** Once every item of the post is queued the screen resets itself, ready for the next link. */
+    fun markAdded(indices: Collection<Int>) {
+        added = added + indices
+        val ready = state as? UiState.Ready ?: return
+        if (added.size >= ready.tweet.media.size) reset()
     }
 
     private fun load(text: String): UiState {

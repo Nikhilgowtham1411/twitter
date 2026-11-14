@@ -45,6 +45,22 @@ object TweetFetcher {
 
     fun extractTweetId(text: String): String? = ID_REGEX.find(text)?.groupValues?.get(1)
 
+    /** e.g. "someuser_1234567890_1.mp4" */
+    fun fileName(tweet: Tweet, index: Int, url: String, kind: MediaKind): String {
+        val handle = tweet.authorHandle.ifEmpty { "x" }
+        val ext = if (kind == MediaKind.PHOTO) photoExtension(url) else "mp4"
+        return "${handle}_${tweet.id}_${index + 1}.$ext"
+    }
+
+    private fun photoExtension(url: String): String {
+        val path = url.substringBefore('?').lowercase()
+        return when {
+            path.endsWith(".png") -> "png"
+            path.endsWith(".webp") -> "webp"
+            else -> "jpg"
+        }
+    }
+
     /** Accepts a pasted/shared link or the full share text; also follows t.co short links. */
     fun resolveTweetId(text: String): String? {
         extractTweetId(text)?.let { return it }

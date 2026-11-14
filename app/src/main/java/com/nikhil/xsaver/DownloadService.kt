@@ -31,13 +31,16 @@ import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Foreground service that downloads queued files one after another, shows a live progress
- * notification (with Cancel), saves into MediaStore (Movies/XSaver or Pictures/XSaver, so no
- * storage permission is needed) and posts a "tap to open" notification for each finished file.
+ * Foreground service that works through a queue: it can look up a shared post link
+ * (quick save) and then downloads files one after another. Every step is mirrored into
+ * [DownloadStore] (the in-app history) and shown as a progress notification with Cancel.
+ * Files go into MediaStore (Movies/XSaver or Pictures/XSaver), so no storage permission is needed.
  */
 class DownloadService : Service() {
 
-    private data class Request(val url: String, val fileName: String, val kind: MediaKind)
+    private sealed interface Work
+    private data class FetchWork(val entryId: Long, val text: String) : Work
+    private data class DownloadWork(val entryId: Long) : Work
 
     private class UserCancelled : Exception()
 
@@ -46,27 +49,77 @@ class DownloadService : Service() {
         private const val CHANNEL_DONE = "xsaver_done"
         private const val FG_ID = 1
         private const val ACTION_CANCEL = "com.nikhil.xsaver.CANCEL"
-        private const val EXTRA_URL = "url"
-        private const val EXTRA_NAME = "name"
-        private const val EXTRA_KIND = "kind"
+        private const val EXTRA_ID = "entry_id"
+        private const val EXTRA_TEXT = "text"
 
-        fun enqueue(context: Context, url: String, fileName: String, kind: MediaKind) {
-            val intent = Intent(context, DownloadService::class.java)
-                .putExtra(EXTRA_URL, url)
-                .putExtra(EXTRA_NAME, fileName)
-                .putExtra(EXTRA_KIND, kind.name)
+        /** Queue files from an already-fetched post (the in-app flow). */
+        fun enqueueDownloads(context: Context, tweet: Tweet, picks: List<Pair<Int, Variant>>) {
+            DownloadStore.init(context)
+            val now = System.currentTimeMillis()
+            for ((index, variant) in picks) {
+                val media = tweet.media[index]
+                val entry = HistoryItem(
+                    id = DownloadStore.newId(),
+                    title = titleFor(tweet, media.kind, index),
+                    fileName = TweetFetcher.fileName(tweet, index, variant.url, media.kind),
+                    kind = media.kind,
+                    thumb = media.thumbnail,
+                    url = variant.url,
+                    status = Status.QUEUED,
+                    time = now,
+                )
+                DownloadStore.add(entry)
+                start(context, Intent(context, DownloadService::class.java).putExtra(EXTRA_ID, entry.id))
+            }
+        }
+
+        /** Quick save: hand over the shared text, the service looks the post up and downloads everything. */
+        fun enqueueShared(context: Context, text: String) {
+            DownloadStore.init(context)
+            val entry = HistoryItem(
+                id = DownloadStore.newId(),
+                title = "Fetching post…",
+                fileName = "",
+                kind = MediaKind.VIDEO,
+                thumb = null,
+                url = null,
+                status = Status.FETCHING,
+            )
+            DownloadStore.add(entry)
+            start(
+                context,
+                Intent(context, DownloadService::class.java)
+                    .putExtra(EXTRA_ID, entry.id)
+                    .putExtra(EXTRA_TEXT, text),
+            )
+        }
+
+        fun retry(context: Context, item: HistoryItem) {
+            if (item.url == null) return
+            DownloadStore.update(item.id) {
+                it.copy(status = Status.QUEUED, progress = 0, bytes = 0, error = null)
+            }
+            start(context, Intent(context, DownloadService::class.java).putExtra(EXTRA_ID, item.id))
+        }
+
+        private fun start(context: Context, intent: Intent) {
             ContextCompat.startForegroundService(context, intent)
+        }
+
+        private fun titleFor(tweet: Tweet, kind: MediaKind, index: Int): String {
+            val label = when (kind) {
+                MediaKind.VIDEO -> "Video"
+                MediaKind.GIF -> "GIF"
+                MediaKind.PHOTO -> "Photo"
+            }
+            val who = if (tweet.authorHandle.isNotEmpty()) "@${tweet.authorHandle} · " else ""
+            return "$who$label ${index + 1}"
         }
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val queue = ConcurrentLinkedQueue<Request>()
+    private val queue = ConcurrentLinkedQueue<Work>()
     private var worker: Job? = null
-
-    @Volatile
-    private var cancelled = false
-    private val completed = AtomicInteger(0)
-    private val total = AtomicInteger(0)
     private val nextDoneId = AtomicInteger(1000)
     private var lastForeground: Notification? = null
     private lateinit var nm: NotificationManager
@@ -75,6 +128,7 @@ class DownloadService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        DownloadStore.init(this)
         nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(
             NotificationChannel(CHANNEL_PROGRESS, "Download progress", NotificationManager.IMPORTANCE_LOW)
@@ -86,44 +140,44 @@ class DownloadService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         // Required within a few seconds of startForegroundService().
-        val initial = lastForeground ?: progressNotification("Starting download", "Preparing…", 0, true)
+        val initial = lastForeground ?: progressNotification("Starting", "Preparing…", 0, true)
         ServiceCompat.startForeground(this, FG_ID, initial, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
 
         if (intent?.action == ACTION_CANCEL) {
-            cancelled = true
             queue.clear()
+            DownloadStore.cancelAll()
             return START_NOT_STICKY
         }
 
-        val url = intent?.getStringExtra(EXTRA_URL)
-        val name = intent?.getStringExtra(EXTRA_NAME)
-        val kind = intent?.getStringExtra(EXTRA_KIND)?.let { runCatching { MediaKind.valueOf(it) }.getOrNull() }
-        if (url != null && name != null && kind != null) {
-            if (worker?.isActive != true) {
-                cancelled = false
-                completed.set(0)
-                total.set(0)
-            }
-            queue.add(Request(url, name, kind))
-            total.incrementAndGet()
+        val id = intent?.getLongExtra(EXTRA_ID, -1L) ?: -1L
+        if (id != -1L) {
+            val text = intent?.getStringExtra(EXTRA_TEXT)
+            queue.add(if (text != null) FetchWork(id, text) else DownloadWork(id))
         }
         if (worker?.isActive != true) launchWorker()
         return START_NOT_STICKY
     }
 
     override fun onDestroy() {
-        cancelled = true
         scope.cancel()
+        DownloadStore.items.value.filter { it.isActive }.forEach { item ->
+            DownloadStore.update(item.id) {
+                it.copy(status = Status.FAILED, error = "Interrupted. Tap Retry.")
+            }
+        }
         super.onDestroy()
     }
 
     private fun launchWorker() {
         worker = scope.launch {
             while (true) {
-                val request = queue.poll() ?: break
-                download(request)
+                val work = queue.poll() ?: break
+                when (work) {
+                    is FetchWork -> fetch(work)
+                    is DownloadWork -> download(work.entryId)
+                }
             }
-            // Decide on the main thread so a download enqueued right now isn't lost.
+            // Decide on the main thread so work enqueued right now isn't lost.
             withContext(Dispatchers.Main) {
                 if (queue.isEmpty()) {
                     ServiceCompat.stopForeground(this@DownloadService, ServiceCompat.STOP_FOREGROUND_REMOVE)
@@ -135,13 +189,63 @@ class DownloadService : Service() {
         }
     }
 
-    private fun download(r: Request) {
-        val title = if (total.get() > 1) "Downloading ${completed.get() + 1} of ${total.get()}" else "Downloading"
-        updateProgress(title, r.fileName, 0, true)
+    // ---- quick save: look the post up, then queue its media ------------------------------
+
+    private fun fetch(w: FetchWork) {
+        val entry = DownloadStore.get(w.entryId) ?: return
+        if (entry.status != Status.FETCHING) return
+        updateProgress("Fetching post", "Looking up media…", 0, true)
+        try {
+            val id = TweetFetcher.resolveTweetId(w.text)
+                ?: throw FetchException("That doesn't look like a link to an X post.")
+            val tweet = TweetFetcher.fetch(id)
+            if (tweet.media.isEmpty()) throw FetchException("No photo, video or GIF found in this post.")
+
+            if (DownloadStore.get(w.entryId)?.status == Status.CANCELLED) return
+            DownloadStore.remove(w.entryId)
+
+            val now = System.currentTimeMillis()
+            tweet.media.forEachIndexed { index, media ->
+                val variant = media.variants.first()
+                val item = HistoryItem(
+                    id = DownloadStore.newId(),
+                    title = titleFor(tweet, media.kind, index),
+                    fileName = TweetFetcher.fileName(tweet, index, variant.url, media.kind),
+                    kind = media.kind,
+                    thumb = media.thumbnail,
+                    url = variant.url,
+                    status = Status.QUEUED,
+                    time = now,
+                )
+                DownloadStore.add(item)
+                queue.add(DownloadWork(item.id))
+            }
+        } catch (e: Exception) {
+            val reason = e.message ?: "Couldn't fetch this post."
+            DownloadStore.update(w.entryId) {
+                it.copy(title = "Couldn't fetch post", status = Status.FAILED, error = reason)
+            }
+            notifyFailedText("Couldn't fetch post", reason)
+        }
+    }
+
+    // ---- downloading ---------------------------------------------------------------------
+
+    private fun download(entryId: Long) {
+        val entry = DownloadStore.get(entryId) ?: return
+        val url = entry.url ?: return
+        if (entry.status != Status.QUEUED) return
+
+        DownloadStore.update(entryId) {
+            it.copy(status = Status.DOWNLOADING, progress = 0, bytes = 0, error = null)
+        }
+        val waiting = queue.size
+        val title = if (waiting > 0) "Downloading (+$waiting waiting)" else "Downloading"
+        updateProgress(title, entry.fileName, 0, true)
 
         val resolver = contentResolver
-        val isVideo = r.kind != MediaKind.PHOTO
-        val mime = mimeFor(r)
+        val isVideo = entry.kind != MediaKind.PHOTO
+        val mime = mimeFor(entry)
         val collection = if (isVideo) {
             MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
         } else {
@@ -149,7 +253,7 @@ class DownloadService : Service() {
         }
         val folder = if (isVideo) Environment.DIRECTORY_MOVIES else Environment.DIRECTORY_PICTURES
         val values = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, r.fileName)
+            put(MediaStore.MediaColumns.DISPLAY_NAME, entry.fileName)
             put(MediaStore.MediaColumns.MIME_TYPE, mime)
             put(MediaStore.MediaColumns.RELATIVE_PATH, "$folder/XSaver")
             put(MediaStore.MediaColumns.IS_PENDING, 1)
@@ -160,7 +264,7 @@ class DownloadService : Service() {
             val target = resolver.insert(collection, values) ?: throw IOException("Couldn't create the file")
             created = target
 
-            val conn = (URL(r.url).openConnection() as HttpURLConnection).apply {
+            val conn = (URL(url).openConnection() as HttpURLConnection).apply {
                 connectTimeout = 15_000
                 readTimeout = 30_000
                 setRequestProperty("User-Agent", TweetFetcher.USER_AGENT)
@@ -176,7 +280,7 @@ class DownloadService : Service() {
                         var sum = 0L
                         var lastUpdate = 0L
                         while (true) {
-                            if (cancelled) throw UserCancelled()
+                            if (DownloadStore.isCancelRequested(entryId)) throw UserCancelled()
                             val n = input.read(buffer)
                             if (n < 0) break
                             stream.write(buffer, 0, n)
@@ -185,7 +289,11 @@ class DownloadService : Service() {
                             if (now - lastUpdate >= 400) {
                                 lastUpdate = now
                                 val pct = if (length > 0) ((sum * 100) / length).toInt() else 0
-                                updateProgress(title, "${r.fileName} · ${formatSize(sum)}", pct, length <= 0)
+                                DownloadStore.update(entryId, persist = false) {
+                                    it.copy(progress = pct, bytes = sum)
+                                }
+                                val text = if (length > 0) "${entry.fileName} · $pct%" else "${entry.fileName} · ${formatSize(sum)}"
+                                updateProgress(title, text, pct, length <= 0)
                             }
                         }
                     }
@@ -196,26 +304,29 @@ class DownloadService : Service() {
 
             val done = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
             resolver.update(target, done, null, null)
-            completed.incrementAndGet()
-            notifyDone(target, mime, r)
+            DownloadStore.update(entryId) {
+                it.copy(status = Status.DONE, progress = 100, uri = target.toString(), mime = mime, error = null)
+            }
+            notifyDone(target, mime, entry)
         } catch (e: UserCancelled) {
             created?.let { runCatching { resolver.delete(it, null, null) } }
+            DownloadStore.update(entryId) { it.copy(status = Status.CANCELLED, error = null) }
         } catch (e: Exception) {
             created?.let { runCatching { resolver.delete(it, null, null) } }
-            completed.incrementAndGet()
-            notifyFailed(r, e.message)
+            val reason = e.message ?: "unknown error"
+            DownloadStore.update(entryId) { it.copy(status = Status.FAILED, error = reason) }
+            notifyFailedText("Download failed", "${entry.fileName}: $reason")
+        } finally {
+            DownloadStore.clearCancelFlag(entryId)
         }
     }
 
-    private fun mimeFor(r: Request): String = when {
-        r.kind != MediaKind.PHOTO -> "video/mp4"
-        r.fileName.endsWith(".png", ignoreCase = true) -> "image/png"
-        r.fileName.endsWith(".webp", ignoreCase = true) -> "image/webp"
+    private fun mimeFor(item: HistoryItem): String = when {
+        item.kind != MediaKind.PHOTO -> "video/mp4"
+        item.fileName.endsWith(".png", ignoreCase = true) -> "image/png"
+        item.fileName.endsWith(".webp", ignoreCase = true) -> "image/webp"
         else -> "image/jpeg"
     }
-
-    private fun formatSize(bytes: Long): String =
-        if (bytes >= 1_048_576) "%.1f MB".format(bytes / 1_048_576.0) else "${bytes / 1024} KB"
 
     // ---- notifications -------------------------------------------------------------------
 
@@ -243,7 +354,7 @@ class DownloadService : Service() {
             .setSilent(true)
             .setProgress(100, percent, indeterminate)
             .setContentIntent(openAppIntent())
-            .addAction(0, "Cancel", cancel)
+            .addAction(0, "Cancel all", cancel)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .build()
         lastForeground = notification
@@ -254,7 +365,7 @@ class DownloadService : Service() {
         nm.notify(FG_ID, progressNotification(title, text, percent, indeterminate))
     }
 
-    private fun notifyDone(uri: Uri, mime: String, r: Request) {
+    private fun notifyDone(uri: Uri, mime: String, item: HistoryItem) {
         val view = Intent(Intent.ACTION_VIEW)
             .setDataAndType(uri, mime)
             .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -265,22 +376,22 @@ class DownloadService : Service() {
             view,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
-        val folder = if (r.kind == MediaKind.PHOTO) "Pictures/XSaver" else "Movies/XSaver"
+        val folder = if (item.kind == MediaKind.PHOTO) "Pictures/XSaver" else "Movies/XSaver"
         val notification = NotificationCompat.Builder(this, CHANNEL_DONE)
             .setSmallIcon(R.drawable.ic_stat_download)
             .setContentTitle("Download complete")
-            .setContentText("${r.fileName} · $folder")
+            .setContentText("${item.fileName} · $folder")
             .setContentIntent(pending)
             .setAutoCancel(true)
             .build()
         nm.notify(id, notification)
     }
 
-    private fun notifyFailed(r: Request, reason: String?) {
+    private fun notifyFailedText(title: String, text: String) {
         val notification = NotificationCompat.Builder(this, CHANNEL_DONE)
             .setSmallIcon(R.drawable.ic_stat_download)
-            .setContentTitle("Download failed")
-            .setContentText("${r.fileName}: ${reason ?: "unknown error"}")
+            .setContentTitle(title)
+            .setContentText(text)
             .setContentIntent(openAppIntent())
             .setAutoCancel(true)
             .build()

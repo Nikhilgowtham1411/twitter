@@ -2,8 +2,11 @@
 
 Android app (Kotlin + Jetpack Compose) that downloads photos, videos and GIFs from X (Twitter) posts.
 
-- **Share target**: in the X app tap Share, then X Saver. The link is picked up automatically.
+- **Two share targets** in the X app's Share sheet:
+  - **X Saver · Quick save**: no screen, you stay in X. The app looks the post up and downloads everything in the background.
+  - **X Saver**: opens the app so you can pick the video quality first.
 - **Or paste** a post link inside the app.
+- **Downloads history** inside the app: every file with live progress, Open, Cancel and Retry. Several links can be queued at once.
 - **Quality picker** for videos (when X offers several), original resolution for photos.
 - **Notifications**: live progress with a Cancel button, and a "tap to open" notification when each file finishes.
 - Files are saved with MediaStore to `Movies/XSaver` and `Pictures/XSaver`, so no storage permission is needed.
