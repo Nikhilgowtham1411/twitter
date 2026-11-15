@@ -4,12 +4,15 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.concurrent.Callable
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlin.math.min
 
 enum class MediaKind { VIDEO, PHOTO, GIF }
 
 /** One downloadable file. Videos can have several qualities; photos have a single "Original". */
-data class Variant(val url: String, val label: String, val bitrate: Int)
+data class Variant(val url: String, val label: String, val bitrate: Int, val size: Long = 0)
 
 data class MediaItem(
     val kind: MediaKind,
@@ -45,11 +48,87 @@ object TweetFetcher {
 
     fun extractTweetId(text: String): String? = ID_REGEX.find(text)?.groupValues?.get(1)
 
-    /** e.g. "someuser_1234567890_1.mp4" */
-    fun fileName(tweet: Tweet, index: Int, url: String, kind: MediaKind): String {
+    /** e.g. "someuser_1234567890_1_720p.mp4" (quality is part of the name so re-downloads don't clash). */
+    fun fileName(tweet: Tweet, index: Int, variant: Variant, kind: MediaKind): String {
         val handle = tweet.authorHandle.ifEmpty { "x" }
-        val ext = if (kind == MediaKind.PHOTO) photoExtension(url) else "mp4"
-        return "${handle}_${tweet.id}_${index + 1}.$ext"
+        val ext = if (kind == MediaKind.PHOTO) photoExtension(variant.url) else "mp4"
+        val quality = if (kind == MediaKind.PHOTO) "" else "_" + variant.label.filter { it.isLetterOrDigit() }
+        return "${handle}_${tweet.id}_${index + 1}$quality.$ext"
+    }
+
+    fun looksLikeLink(text: String): Boolean =
+        extractTweetId(text) != null || SHORT_REGEX.containsMatchIn(text)
+
+    /** Resolve the link, fetch the post and measure how many bytes each quality will use. */
+    fun load(text: String): Tweet {
+        val id = resolveTweetId(text) ?: throw FetchException("That doesn't look like a link to an X post.")
+        val tweet = fetch(id)
+        if (tweet.media.isEmpty()) throw FetchException("No photo, video or GIF found in this post.")
+        return withSizes(tweet)
+    }
+
+    /** Looks up every file's size in parallel so the app can say "1280p · 5.0 MB" before downloading. */
+    private fun withSizes(tweet: Tweet): Tweet {
+        val pool = Executors.newFixedThreadPool(6)
+        try {
+            val futures = tweet.media.map { m ->
+                m.variants.map { v -> pool.submit(Callable { probeSize(v.url) }) }
+            }
+            val media = tweet.media.mapIndexed { i, m ->
+                m.copy(
+                    variants = m.variants.mapIndexed { j, v ->
+                        val size = try {
+                            futures[i][j].get(10, TimeUnit.SECONDS)
+                        } catch (e: Exception) {
+                            0L
+                        }
+                        v.copy(size = size)
+                    }
+                )
+            }
+            return tweet.copy(media = media)
+        } finally {
+            pool.shutdownNow()
+        }
+    }
+
+    private fun probeSize(url: String): Long {
+        try {
+            val head = (URL(url).openConnection() as HttpURLConnection).apply {
+                requestMethod = "HEAD"
+                connectTimeout = 6_000
+                readTimeout = 6_000
+                setRequestProperty("User-Agent", USER_AGENT)
+            }
+            try {
+                if (head.responseCode in 200..299) {
+                    val length = head.contentLengthLong
+                    if (length > 0) return length
+                }
+            } finally {
+                head.disconnect()
+            }
+        } catch (e: Exception) {
+            // fall through to the range probe
+        }
+        try {
+            val get = (URL(url).openConnection() as HttpURLConnection).apply {
+                connectTimeout = 6_000
+                readTimeout = 6_000
+                setRequestProperty("User-Agent", USER_AGENT)
+                setRequestProperty("Range", "bytes=0-0")
+            }
+            try {
+                // "Content-Range: bytes 0-0/5242880"
+                val total = get.getHeaderField("Content-Range")?.substringAfterLast('/')?.toLongOrNull()
+                if (total != null && total > 0) return total
+            } finally {
+                get.disconnect()
+            }
+        } catch (e: Exception) {
+            // unknown size
+        }
+        return 0L
     }
 
     private fun photoExtension(url: String): String {

@@ -7,7 +7,6 @@ import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -20,7 +19,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
@@ -35,14 +33,15 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.remember
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -79,11 +78,14 @@ fun XSaverApp(
     vm: MainViewModel,
     onDownload: (Tweet, Int, Variant) -> Unit,
     onDownloadAll: (Tweet) -> Unit,
+    onPanelToggle: (Boolean) -> Unit,
+    onBatterySettings: () -> Unit,
 ) {
     val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
     val focus = LocalFocusManager.current
     val history by DownloadStore.items.collectAsState()
+    val links by LinkStore.links.collectAsState()
 
     MaterialTheme(colorScheme = XColors) {
         Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
@@ -118,7 +120,6 @@ fun XSaverApp(
                     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         OutlinedButton(
                             onClick = {
-                                // Replaces whatever link was there before.
                                 val pasted = clipboard.getText()?.text
                                 if (!pasted.isNullOrBlank()) {
                                     vm.input = pasted
@@ -134,47 +135,55 @@ fun XSaverApp(
                                 vm.fetch()
                             },
                             modifier = Modifier.weight(1f),
-                        ) { Text("Get media") }
-                        if (vm.input.isNotEmpty() || vm.state !is UiState.Idle) {
+                        ) { Text("Save link") }
+                        if (vm.input.isNotEmpty() || vm.error != null) {
                             TextButton(onClick = { vm.reset() }) { Text("Clear") }
                         }
                     }
                 }
 
-                when (val s = vm.state) {
-                    is UiState.Idle -> item {
+                if (vm.loading > 0) {
+                    item {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                            Text(
+                                if (vm.loading == 1) "Looking up the link…" else "Looking up ${vm.loading} links…",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+
+                val err = vm.error
+                if (err != null) item { Note(err, error = true) }
+
+                item { PanelCard(vm.panelOn, onPanelToggle) }
+
+                if (!vm.batteryOk) item { BatteryCard(onBatterySettings) }
+
+                if (links.isEmpty() && history.isEmpty() && vm.loading == 0 && err == null) {
+                    item {
                         Note(
-                            "Tip: in X tap Share and pick \"X Saver · Quick save\" to download " +
-                                "without opening this app. Pick \"X Saver\" to choose the video quality first."
+                            "Share a post from X to this app, or paste its link above. The link is kept here " +
+                                "with every quality and how much data it uses. Pick \"X Saver · Quick save\" in " +
+                                "the share sheet to download straight away without opening the app."
                         )
                     }
+                }
 
-                    is UiState.Loading -> item {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(24.dp),
-                            contentAlignment = Alignment.Center,
-                        ) { CircularProgressIndicator() }
-                    }
-
-                    is UiState.Failed -> item { Note(s.message, error = true) }
-
-                    is UiState.Ready -> {
-                        item { AuthorBlock(s.tweet) }
-                        if (s.tweet.media.size > 1) {
-                            item {
-                                Button(
-                                    onClick = { onDownloadAll(s.tweet) },
-                                    modifier = Modifier.fillMaxWidth(),
-                                ) { Text("Download all (${s.tweet.media.size})") }
-                            }
-                        }
-                        itemsIndexed(s.tweet.media) { index, media ->
-                            MediaCard(index, media, added = index in vm.added) { variant ->
-                                onDownload(s.tweet, index, variant)
-                            }
-                        }
+                if (links.isNotEmpty()) {
+                    item { SectionTitle("Saved links") }
+                    items(links, key = { it.tweet.id }) { link ->
+                        LinkCard(
+                            link = link,
+                            onDownload = { index, variant -> onDownload(link.tweet, index, variant) },
+                            onDownloadAll = { onDownloadAll(link.tweet) },
+                            onRemove = { LinkStore.remove(link.tweet.id) },
+                        )
                     }
                 }
 
@@ -230,6 +239,17 @@ private fun Header() {
 }
 
 @Composable
+private fun SectionTitle(text: String) {
+    Text(
+        text,
+        modifier = Modifier.padding(top = 10.dp),
+        style = MaterialTheme.typography.titleLarge,
+        fontWeight = FontWeight.Bold,
+        color = MaterialTheme.colorScheme.onBackground,
+    )
+}
+
+@Composable
 private fun Note(text: String, error: Boolean = false) {
     Text(
         text,
@@ -239,78 +259,182 @@ private fun Note(text: String, error: Boolean = false) {
 }
 
 @Composable
-private fun AuthorBlock(tweet: Tweet) {
-    val handle = if (tweet.authorHandle.isNotEmpty()) "@${tweet.authorHandle}" else ""
-    val who = listOf(tweet.authorName, handle).filter { it.isNotEmpty() }.joinToString("  ")
-    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        if (who.isNotEmpty()) {
-            Text(who, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onBackground)
-        }
-        if (tweet.text.isNotBlank()) {
-            Text(
-                tweet.text,
-                maxLines = 4,
-                overflow = TextOverflow.Ellipsis,
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+private fun PanelCard(on: Boolean, onToggle: (Boolean) -> Unit) {
+    Card(
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text("Notification panel", fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
+                Text(
+                    "Adds a panel to your notification shade. Copy a link, tap Paste & save (or type it there) " +
+                        "and it appears in Saved links, ready to download. No need to open the app.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Switch(checked = on, onCheckedChange = onToggle)
         }
     }
 }
 
 @Composable
-private fun MediaCard(index: Int, media: MediaItem, added: Boolean, onDownload: (Variant) -> Unit) {
-    var selected by remember(media) { mutableIntStateOf(0) }
+private fun BatteryCard(onClick: () -> Unit) {
+    Card(
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text("Downloads stopping midway?", fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
+            Text(
+                "Some phones pause apps in the background to save battery. Allow X Saver to run in the " +
+                    "background so big downloads finish even with the screen off.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            OutlinedButton(onClick = onClick) { Text("Allow background downloads") }
+        }
+    }
+}
+
+@Composable
+private fun LinkCard(
+    link: SavedLink,
+    onDownload: (Int, Variant) -> Unit,
+    onDownloadAll: () -> Unit,
+    onRemove: () -> Unit,
+) {
+    val tweet = link.tweet
+    val handle = if (tweet.authorHandle.isNotEmpty()) "@${tweet.authorHandle}" else ""
+    val who = listOf(tweet.authorName, handle).filter { it.isNotEmpty() }.joinToString("  ")
+
+    Card(
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Row(verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    if (who.isNotEmpty()) {
+                        Text(who, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
+                    }
+                    if (tweet.text.isNotBlank()) {
+                        Text(
+                            tweet.text,
+                            maxLines = 3,
+                            overflow = TextOverflow.Ellipsis,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                TextButton(onClick = onRemove) { Text("Remove") }
+            }
+
+            if (tweet.media.size > 1) {
+                val totalSize = tweet.media.sumOf { it.variants.first().size }
+                val sizeText = if (totalSize > 0) " · ${formatSize(totalSize)}" else ""
+                Button(onClick = onDownloadAll, modifier = Modifier.fillMaxWidth()) {
+                    Text("Download all (${tweet.media.size}) in best quality$sizeText")
+                }
+            }
+
+            tweet.media.forEachIndexed { index, media ->
+                MediaRow(
+                    tweetId = tweet.id,
+                    index = index,
+                    media = media,
+                    doneLabel = link.downloaded[index],
+                    onDownload = { variant -> onDownload(index, variant) },
+                )
+            }
+        }
+    }
+}
+
+private fun chipLabel(v: Variant): String =
+    if (v.size > 0) "${v.label} · ${formatSize(v.size)}" else v.label
+
+@Composable
+private fun MediaRow(
+    tweetId: String,
+    index: Int,
+    media: MediaItem,
+    doneLabel: String?,
+    onDownload: (Variant) -> Unit,
+) {
+    var selected by rememberSaveable(tweetId, index) { mutableStateOf(0) }
+    val variant = media.variants[selected.coerceIn(0, media.variants.lastIndex)]
     val label = when (media.kind) {
         MediaKind.VIDEO -> "Video"
         MediaKind.GIF -> "GIF"
         MediaKind.PHOTO -> "Photo"
     } + " ${index + 1}"
 
-    Card(
-        shape = RoundedCornerShape(20.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-    ) {
-        Row(
-            modifier = Modifier.padding(12.dp),
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            AsyncImage(
-                model = media.thumbnail,
-                contentDescription = label,
-                contentScale = ContentScale.Crop,
-                modifier = Modifier
-                    .size(96.dp)
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(MaterialTheme.colorScheme.surface),
+    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        AsyncImage(
+            model = media.thumbnail,
+            contentDescription = label,
+            contentScale = ContentScale.Crop,
+            modifier = Modifier
+                .size(88.dp)
+                .clip(RoundedCornerShape(14.dp))
+                .background(MaterialTheme.colorScheme.surface),
+        )
+        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(
+                label,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurface,
             )
-            Column(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                Text(
-                    label,
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
-                    color = MaterialTheme.colorScheme.onSurface,
-                )
-                if (media.variants.size > 1) {
-                    Row(
-                        modifier = Modifier.horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    ) {
-                        media.variants.forEachIndexed { i, variant ->
-                            FilterChip(
-                                selected = i == selected,
-                                onClick = { selected = i },
-                                label = { Text(variant.label) },
-                            )
-                        }
+            if (media.variants.size > 1) {
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    media.variants.forEachIndexed { i, v ->
+                        FilterChip(
+                            selected = i == selected,
+                            onClick = { selected = i },
+                            label = { Text(chipLabel(v)) },
+                        )
                     }
                 }
-                Button(onClick = { onDownload(media.variants[selected]) }) {
-                    Text(if (added) "Added ✓" else "Download")
-                }
+            }
+            if (variant.size > 0) {
+                Text(
+                    "Uses about ${formatSize(variant.size)} of data",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Button(onClick = { onDownload(variant) }) {
+                Text(if (doneLabel == null) "Download" else "Download again")
+            }
+            if (doneLabel != null) {
+                Text(
+                    "Saved before: $doneLabel. Pick another quality to get it again.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
     }
@@ -381,8 +505,11 @@ private fun HistoryRow(
 private fun statusText(item: HistoryItem): String = when (item.status) {
     Status.FETCHING -> "Looking up the post…"
     Status.QUEUED -> "Waiting in queue"
-    Status.DOWNLOADING ->
-        if (item.progress > 0) "${item.progress}% · ${formatSize(item.bytes)}" else "Starting… ${formatSize(item.bytes)}"
+    Status.DOWNLOADING -> when {
+        item.error != null -> item.error
+        item.progress > 0 -> "${item.progress}% · ${formatSize(item.bytes)}"
+        else -> "Starting… ${formatSize(item.bytes)}"
+    }
     Status.DONE -> {
         val folder = if (item.kind == MediaKind.PHOTO) "Pictures/XSaver" else "Movies/XSaver"
         "Saved · $folder"
